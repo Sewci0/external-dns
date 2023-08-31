@@ -42,7 +42,7 @@ func NewAWSSDRegistry(provider provider.Provider, ownerID string) (*AWSSDRegistr
 	}, nil
 }
 
-func (sdr *AWSSDRegistry) GetDomainFilter() endpoint.DomainFilterInterface {
+func (sdr *AWSSDRegistry) GetDomainFilter() endpoint.DomainFilter {
 	return sdr.provider.GetDomainFilter()
 }
 
@@ -93,10 +93,6 @@ func (sdr *AWSSDRegistry) updateLabels(endpoints []*endpoint.Endpoint) {
 		ep.Labels[endpoint.OwnerLabelKey] = sdr.ownerID
 		ep.Labels[endpoint.AWSSDDescriptionLabel] = ep.Labels.SerializePlain(false)
 	}
-}
-
-func (sdr *AWSSDRegistry) PropertyValuesEqual(name string, previous string, current string) bool {
-	return sdr.provider.PropertyValuesEqual(name, previous, current)
 }
 
 // AdjustEndpoints modifies the endpoints as needed by the specific provider

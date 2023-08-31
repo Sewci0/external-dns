@@ -130,7 +130,7 @@ func getDNSRecordFromRecordParams(rp any) cloudflare.DNSRecord {
 	}
 }
 
-func (m *mockCloudFlareClient) CreateDNSRecord(ctx context.Context, rc *cloudflare.ResourceContainer, rp cloudflare.CreateDNSRecordParams) (*cloudflare.DNSRecordResponse, error) {
+func (m *mockCloudFlareClient) CreateDNSRecord(ctx context.Context, rc *cloudflare.ResourceContainer, rp cloudflare.CreateDNSRecordParams) (cloudflare.DNSRecord, error) {
 	recordData := getDNSRecordFromRecordParams(rp)
 	m.Actions = append(m.Actions, MockAction{
 		Name:       "Create",
@@ -141,7 +141,7 @@ func (m *mockCloudFlareClient) CreateDNSRecord(ctx context.Context, rc *cloudfla
 	if zone, ok := m.Records[rc.Identifier]; ok {
 		zone[rp.ID] = recordData
 	}
-	return nil, nil
+	return cloudflare.DNSRecord{}, nil
 }
 
 func (m *mockCloudFlareClient) ListDNSRecords(ctx context.Context, rc *cloudflare.ResourceContainer, rp cloudflare.ListDNSRecordsParams) ([]cloudflare.DNSRecord, *cloudflare.ResultInfo, error) {
@@ -301,6 +301,8 @@ func AssertActions(t *testing.T, provider *CloudFlareProvider, endpoints []*endp
 	if err != nil {
 		t.Fatalf("cannot fetch records, %s", err)
 	}
+
+	endpoints = provider.AdjustEndpoints(endpoints)
 
 	plan := &plan.Plan{
 		Current:        records,
@@ -680,7 +682,7 @@ func TestCloudflareProvider(t *testing.T) {
 
 	_ = os.Unsetenv("CF_API_TOKEN")
 	tokenFile := "/tmp/cf_api_token"
-	if err := os.WriteFile(tokenFile, []byte("abc123def"), 0644); err != nil {
+	if err := os.WriteFile(tokenFile, []byte("abc123def"), 0o644); err != nil {
 		t.Errorf("failed to write token file, %s", err)
 	}
 	_ = os.Setenv("CF_API_TOKEN", tokenFile)
@@ -1145,11 +1147,12 @@ func TestProviderPropertiesIdempotency(t *testing.T) {
 				})
 			}
 
+			desired = provider.AdjustEndpoints(desired)
+
 			plan := plan.Plan{
-				Current:            current,
-				Desired:            desired,
-				PropertyComparator: provider.PropertyValuesEqual,
-				ManagedRecords:     []string{endpoint.RecordTypeA, endpoint.RecordTypeCNAME},
+				Current:        current,
+				Desired:        desired,
+				ManagedRecords: []string{endpoint.RecordTypeA, endpoint.RecordTypeCNAME},
 			}
 
 			plan = *plan.Calculate()
@@ -1188,7 +1191,7 @@ func TestCloudflareComplexUpdate(t *testing.T) {
 
 	plan := &plan.Plan{
 		Current: records,
-		Desired: []*endpoint.Endpoint{
+		Desired: provider.AdjustEndpoints([]*endpoint.Endpoint{
 			{
 				DNSName:    "foobar.bar.com",
 				Targets:    endpoint.Targets{"1.2.3.4", "2.3.4.5"},
@@ -1202,7 +1205,7 @@ func TestCloudflareComplexUpdate(t *testing.T) {
 					},
 				},
 			},
-		},
+		}),
 		DomainFilter:   endpoint.NewDomainFilter([]string{"bar.com"}),
 		ManagedRecords: []string{endpoint.RecordTypeA, endpoint.RecordTypeCNAME},
 	}

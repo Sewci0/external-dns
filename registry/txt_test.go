@@ -216,13 +216,13 @@ func testTXTRegistryRecordsPrefixed(t *testing.T) {
 	r, _ := NewTXTRegistry(p, "txt.", "", "owner", time.Hour, "wc", []string{}, false, nil)
 	records, _ := r.Records(ctx)
 
-	assert.ElementsMatch(t, expectedRecords, records)
+	assert.True(t, testutils.SameEndpoints(records, expectedRecords))
 
 	// Ensure prefix is case-insensitive
-	r, _ = NewTXTRegistry(p, "TxT.", "", "owner", time.Hour, "", []string{}, false, nil)
+	r, _ = NewTXTRegistry(p, "TxT.", "", "owner", time.Hour, "wc", []string{}, false, nil)
 	records, _ = r.Records(ctx)
 
-	assert.ElementsMatch(t, expectedRecords, records)
+	assert.True(t, testutils.SameEndpoints(records, expectedRecords))
 }
 
 func testTXTRegistryRecordsSuffixed(t *testing.T) {
@@ -583,7 +583,6 @@ func testTXTRegistryApplyChangesWithTemplatedPrefix(t *testing.T) {
 	expected := &plan.Changes{
 		Create: []*endpoint.Endpoint{
 			newEndpointWithOwnerResource("new-record-1.test-zone.example.org", "new-loadbalancer-1.lb.com", endpoint.RecordTypeCNAME, "owner", "ingress/default/my-ingress"),
-			newEndpointWithOwnerAndOwnedRecord("prefix.new-record-1.test-zone.example.org", "\"heritage=external-dns,external-dns/owner=owner,external-dns/resource=ingress/default/my-ingress\"", endpoint.RecordTypeTXT, "", "new-record-1.test-zone.example.org"),
 			newEndpointWithOwnerAndOwnedRecord("prefixcname.new-record-1.test-zone.example.org", "\"heritage=external-dns,external-dns/owner=owner,external-dns/resource=ingress/default/my-ingress\"", endpoint.RecordTypeTXT, "", "new-record-1.test-zone.example.org"),
 		},
 	}
@@ -628,7 +627,6 @@ func testTXTRegistryApplyChangesWithTemplatedSuffix(t *testing.T) {
 		Create: []*endpoint.Endpoint{
 			newEndpointWithOwnerResource("new-record-1.test-zone.example.org", "new-loadbalancer-1.lb.com", endpoint.RecordTypeCNAME, "owner", "ingress/default/my-ingress"),
 			newEndpointWithOwnerAndOwnedRecord("new-record-1-cnamesuffix.test-zone.example.org", "\"heritage=external-dns,external-dns/owner=owner,external-dns/resource=ingress/default/my-ingress\"", endpoint.RecordTypeTXT, "", "new-record-1.test-zone.example.org"),
-			newEndpointWithOwnerAndOwnedRecord("new-record-1-suffix.test-zone.example.org", "\"heritage=external-dns,external-dns/owner=owner,external-dns/resource=ingress/default/my-ingress\"", endpoint.RecordTypeTXT, "", "new-record-1.test-zone.example.org"),
 		},
 	}
 	p.OnApplyChanges = func(ctx context.Context, got *plan.Changes) {
@@ -1174,6 +1172,7 @@ func TestExtractRecordTypeDefaultPosition(t *testing.T) {
 			expectedType: "",
 		},
 	}
+
 	for _, tc := range tests {
 		t.Run(tc.input, func(t *testing.T) {
 			actualName, actualType := extractRecordTypeDefaultPosition(tc.input)
@@ -1184,81 +1183,120 @@ func TestExtractRecordTypeDefaultPosition(t *testing.T) {
 }
 
 func TestToEndpointNameNewTXT(t *testing.T) {
-	type testCase struct {
+	tests := []struct {
 		name       string
 		mapper     affixNameMapper
 		domain     string
+		txtDomain  string
 		recordType string
-	}
-
-	testCases := []testCase{
+	}{
 		{
 			name:       "prefix",
 			mapper:     newaffixNameMapper("foo", "", ""),
 			domain:     "example.com",
 			recordType: "A",
+			txtDomain:  "fooa-example.com",
 		},
 		{
 			name:       "suffix",
 			mapper:     newaffixNameMapper("", "foo", ""),
 			domain:     "example.com",
 			recordType: "AAAA",
+			txtDomain:  "aaaa-examplefoo.com",
 		},
 		{
 			name:       "prefix with dash",
 			mapper:     newaffixNameMapper("foo-", "", ""),
 			domain:     "example.com",
 			recordType: "A",
+			txtDomain:  "foo-a-example.com",
 		},
 		{
 			name:       "suffix with dash",
 			mapper:     newaffixNameMapper("", "-foo", ""),
 			domain:     "example.com",
 			recordType: "CNAME",
+			txtDomain:  "cname-example-foo.com",
 		},
 		{
 			name:       "prefix with dot",
 			mapper:     newaffixNameMapper("foo.", "", ""),
 			domain:     "example.com",
 			recordType: "CNAME",
+			txtDomain:  "foo.cname-example.com",
 		},
 		{
 			name:       "suffix with dot",
 			mapper:     newaffixNameMapper("", ".foo", ""),
 			domain:     "example.com",
 			recordType: "CNAME",
+			txtDomain:  "cname-example.foo.com",
+		},
+		{
+			name:       "prefix with multiple dots",
+			mapper:     newaffixNameMapper("foo.bar.", "", ""),
+			domain:     "example.com",
+			recordType: "CNAME",
+			txtDomain:  "foo.bar.cname-example.com",
+		},
+		{
+			name:       "suffix with multiple dots",
+			mapper:     newaffixNameMapper("", ".foo.bar.test", ""),
+			domain:     "example.com",
+			recordType: "CNAME",
+			txtDomain:  "cname-example.foo.bar.test.com",
 		},
 		{
 			name:       "templated prefix",
 			mapper:     newaffixNameMapper("%{record_type}-foo", "", ""),
 			domain:     "example.com",
 			recordType: "A",
+			txtDomain:  "a-fooexample.com",
 		},
 		{
 			name:       "templated suffix",
 			mapper:     newaffixNameMapper("", "foo-%{record_type}", ""),
 			domain:     "example.com",
 			recordType: "A",
+			txtDomain:  "examplefoo-a.com",
 		},
 		{
 			name:       "templated prefix with dot",
 			mapper:     newaffixNameMapper("%{record_type}foo.", "", ""),
 			domain:     "example.com",
 			recordType: "CNAME",
+			txtDomain:  "cnamefoo.example.com",
 		},
 		{
 			name:       "templated suffix with dot",
 			mapper:     newaffixNameMapper("", ".foo%{record_type}", ""),
 			domain:     "example.com",
 			recordType: "A",
+			txtDomain:  "example.fooa.com",
+		},
+		{
+			name:       "templated prefix with multiple dots",
+			mapper:     newaffixNameMapper("bar.%{record_type}.foo.", "", ""),
+			domain:     "example.com",
+			recordType: "CNAME",
+			txtDomain:  "bar.cname.foo.example.com",
+		},
+		{
+			name:       "templated suffix with multiple dots",
+			mapper:     newaffixNameMapper("", ".foo%{record_type}.bar", ""),
+			domain:     "example.com",
+			recordType: "A",
+			txtDomain:  "example.fooa.bar.com",
 		},
 	}
 
-	for _, tc := range testCases {
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			txtName := tc.mapper.toNewTXTName(tc.domain, tc.recordType)
-			res, _ := tc.mapper.toEndpointName(txtName)
-			assert.Equal(t, tc.domain, res)
+			txtDomain := tc.mapper.toNewTXTName(tc.domain, tc.recordType)
+			assert.Equal(t, tc.txtDomain, txtDomain)
+
+			domain, _ := tc.mapper.toEndpointName(txtDomain)
+			assert.Equal(t, tc.domain, domain)
 		})
 	}
 }

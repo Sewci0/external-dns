@@ -36,7 +36,7 @@ func NewNoopRegistry(provider provider.Provider) (*NoopRegistry, error) {
 	}, nil
 }
 
-func (im *NoopRegistry) GetDomainFilter() endpoint.DomainFilterInterface {
+func (im *NoopRegistry) GetDomainFilter() endpoint.DomainFilter {
 	return im.provider.GetDomainFilter()
 }
 
@@ -48,11 +48,6 @@ func (im *NoopRegistry) Records(ctx context.Context) ([]*endpoint.Endpoint, erro
 // ApplyChanges propagates changes to the dns provider
 func (im *NoopRegistry) ApplyChanges(ctx context.Context, changes *plan.Changes) error {
 	return im.provider.ApplyChanges(ctx, changes)
-}
-
-// PropertyValuesEqual compares two property values for equality
-func (im *NoopRegistry) PropertyValuesEqual(attribute string, previous string, current string) bool {
-	return im.provider.PropertyValuesEqual(attribute, previous, current)
 }
 
 // AdjustEndpoints modifies the endpoints as needed by the specific provider

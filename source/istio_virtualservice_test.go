@@ -31,6 +31,7 @@ import (
 	istiofake "istio.io/client-go/pkg/clientset/versioned/fake"
 	fakenetworking3 "istio.io/client-go/pkg/clientset/versioned/typed/networking/v1alpha3/fake"
 	v1 "k8s.io/api/core/v1"
+	networkv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -46,7 +47,8 @@ type VirtualServiceSuite struct {
 	suite.Suite
 	source     Source
 	lbServices []*v1.Service
-	gwconfig   networkingv1alpha3.Gateway
+	ingresses  []*networkv1.Ingress
+	gwconfig   *networkingv1alpha3.Gateway
 	vsconfig   *networkingv1alpha3.VirtualService
 }
 
@@ -75,12 +77,32 @@ func (suite *VirtualServiceSuite) SetupTest() {
 		suite.NoError(err, "should succeed")
 	}
 
+	suite.ingresses = []*networkv1.Ingress{
+		(fakeIngress{
+			ips:       []string{"2.2.2.2"},
+			hostnames: []string{"v2"},
+			namespace: "istio-system",
+			name:      "istio-ingress",
+		}).Ingress(),
+		(fakeIngress{
+			ips:       []string{"3.3.3.3"},
+			hostnames: []string{"v62"},
+			namespace: "istio-system",
+			name:      "istio-ingress2",
+		}).Ingress(),
+	}
+
+	for _, ingress := range suite.ingresses {
+		_, err = fakeKubernetesClient.NetworkingV1().Ingresses(ingress.Namespace).Create(context.Background(), ingress, metav1.CreateOptions{})
+		suite.NoError(err, "should succeed")
+	}
+
 	suite.gwconfig = (fakeGatewayConfig{
 		name:      "foo-gateway-with-targets",
 		namespace: "istio-system",
 		dnsnames:  [][]string{{"*"}},
 	}).Config()
-	_, err = fakeIstioClient.NetworkingV1alpha3().Gateways(suite.gwconfig.Namespace).Create(context.Background(), &suite.gwconfig, metav1.CreateOptions{})
+	_, err = fakeIstioClient.NetworkingV1alpha3().Gateways(suite.gwconfig.Namespace).Create(context.Background(), suite.gwconfig, metav1.CreateOptions{})
 	suite.NoError(err, "should succeed")
 
 	suite.vsconfig = (fakeVirtualServiceConfig{
@@ -366,7 +388,7 @@ func testVirtualServiceBindsToGateway(t *testing.T) {
 		t.Run(ti.title, func(t *testing.T) {
 			vsconfig := ti.vsconfig.Config()
 			gwconfig := ti.gwconfig.Config()
-			require.Equal(t, ti.expected, virtualServiceBindsToGateway(vsconfig, &gwconfig, ti.vsHost))
+			require.Equal(t, ti.expected, virtualServiceBindsToGateway(vsconfig, gwconfig, ti.vsHost))
 		})
 	}
 }
@@ -377,6 +399,7 @@ func testEndpointsFromVirtualServiceConfig(t *testing.T) {
 	for _, ti := range []struct {
 		title      string
 		lbServices []fakeIngressGatewayService
+		ingresses  []fakeIngress
 		gwconfig   fakeGatewayConfig
 		vsconfig   fakeVirtualServiceConfig
 		expected   []*endpoint.Endpoint
@@ -557,12 +580,76 @@ func testEndpointsFromVirtualServiceConfig(t *testing.T) {
 				},
 			},
 		},
+		{
+			title: "ingress gateway annotation same namespace",
+			ingresses: []fakeIngress{
+				{
+					name:      "ingress1",
+					hostnames: []string{"alb.com", "elb.com"},
+				},
+				{
+					name: "ingress2",
+					ips:  []string{"127.0.0.1", "8.8.8.8"},
+				},
+			},
+			gwconfig: fakeGatewayConfig{
+				name:     "mygw",
+				dnsnames: [][]string{{"*"}},
+				annotations: map[string]string{
+					IstioGatewayIngressSource: "ingress1",
+				},
+			},
+			vsconfig: fakeVirtualServiceConfig{
+				gateways: []string{"mygw"},
+				dnsnames: []string{"foo.bar"},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "foo.bar",
+					RecordType: endpoint.RecordTypeCNAME,
+					Targets:    endpoint.Targets{"alb.com", "elb.com"},
+				},
+			},
+		},
+		{
+			title: "ingress gateway annotation separate namespace",
+			ingresses: []fakeIngress{
+				{
+					name:      "ingress1",
+					namespace: "ingress",
+					hostnames: []string{"alb.com", "elb.com"},
+				},
+				{
+					name:      "ingress2",
+					namespace: "ingress",
+					ips:       []string{"127.0.0.1", "8.8.8.8"},
+				},
+			},
+			gwconfig: fakeGatewayConfig{
+				name:     "mygw",
+				dnsnames: [][]string{{"*"}},
+				annotations: map[string]string{
+					IstioGatewayIngressSource: "ingress/ingress2",
+				},
+			},
+			vsconfig: fakeVirtualServiceConfig{
+				gateways: []string{"mygw"},
+				dnsnames: []string{"foo.bar"},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "foo.bar",
+					RecordType: endpoint.RecordTypeA,
+					Targets:    endpoint.Targets{"127.0.0.1", "8.8.8.8"},
+				},
+			},
+		},
 	} {
 		ti := ti
 		t.Run(ti.title, func(t *testing.T) {
 			t.Parallel()
 
-			if source, err := newTestVirtualServiceSource(ti.lbServices, []fakeGatewayConfig{ti.gwconfig}); err != nil {
+			if source, err := newTestVirtualServiceSource(ti.lbServices, ti.ingresses, []fakeGatewayConfig{ti.gwconfig}); err != nil {
 				require.NoError(t, err)
 			} else if endpoints, err := source.endpointsFromVirtualService(context.Background(), ti.vsconfig.Config()); err != nil {
 				require.NoError(t, err)
@@ -582,6 +669,7 @@ func testVirtualServiceEndpoints(t *testing.T) {
 		targetNamespace          string
 		annotationFilter         string
 		lbServices               []fakeIngressGatewayService
+		ingresses                []fakeIngress
 		gwConfigs                []fakeGatewayConfig
 		vsConfigs                []fakeVirtualServiceConfig
 		expected                 []*endpoint.Endpoint
@@ -609,6 +697,78 @@ func testVirtualServiceEndpoints(t *testing.T) {
 					name:      "fake2",
 					namespace: namespace,
 					dnsnames:  [][]string{{"new.org"}},
+				},
+			},
+			vsConfigs: []fakeVirtualServiceConfig{
+				{
+					name:      "vs1",
+					namespace: namespace,
+					gateways:  []string{"fake1"},
+					dnsnames:  []string{"example.org"},
+				},
+				{
+					name:      "vs2",
+					namespace: namespace,
+					gateways:  []string{"fake2"},
+					dnsnames:  []string{"new.org"},
+				},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "example.org",
+					RecordType: endpoint.RecordTypeA,
+					Targets:    endpoint.Targets{"8.8.8.8"},
+				},
+				{
+					DNSName:    "example.org",
+					RecordType: endpoint.RecordTypeCNAME,
+					Targets:    endpoint.Targets{"lb.com"},
+				},
+				{
+					DNSName:    "new.org",
+					RecordType: endpoint.RecordTypeA,
+					Targets:    endpoint.Targets{"8.8.8.8"},
+				},
+				{
+					DNSName:    "new.org",
+					RecordType: endpoint.RecordTypeCNAME,
+					Targets:    endpoint.Targets{"lb.com"},
+				},
+			},
+		},
+		{
+			title: "two simple virtualservices with one gateway each, one ingress",
+			lbServices: []fakeIngressGatewayService{
+				{
+					namespace: namespace,
+					ips:       []string{"8.8.8.8"},
+					hostnames: []string{"lb.com"},
+				},
+			},
+			ingresses: []fakeIngress{
+				{
+					name:      "ingress1",
+					namespace: namespace,
+					ips:       []string{"8.8.8.8"},
+					hostnames: []string{"lb.com"},
+				},
+			},
+			gwConfigs: []fakeGatewayConfig{
+				{
+					name:      "fake1",
+					namespace: namespace,
+					dnsnames:  [][]string{{"example.org"}},
+					annotations: map[string]string{
+						IstioGatewayIngressSource: "ingress1",
+					},
+				},
+				{
+					name:      "fake2",
+					namespace: namespace,
+					dnsnames:  [][]string{{"new.org"}},
+					annotations: map[string]string{
+						IstioGatewayIngressSource: "ingress1",
+					},
 				},
 			},
 			vsConfigs: []fakeVirtualServiceConfig{
@@ -782,6 +942,54 @@ func testVirtualServiceEndpoints(t *testing.T) {
 			},
 		},
 		{
+			title:           "two simple virtualservices with one gateway on different namespaces and a target namespace, one ingress",
+			targetNamespace: "testing1",
+			ingresses: []fakeIngress{
+				{
+					name:      "ingress1",
+					ips:       []string{"8.8.8.8"},
+					hostnames: []string{"lb.com"},
+					namespace: "testing1",
+				},
+			},
+			gwConfigs: []fakeGatewayConfig{
+				{
+					name:      "fake1",
+					namespace: "testing1",
+					dnsnames:  [][]string{{"*"}},
+					annotations: map[string]string{
+						IstioGatewayIngressSource: "ingress1",
+					},
+				},
+			},
+			vsConfigs: []fakeVirtualServiceConfig{
+				{
+					name:      "vs1",
+					namespace: "testing1",
+					gateways:  []string{"testing1/fake1"},
+					dnsnames:  []string{"example.org"},
+				},
+				{
+					name:      "vs2",
+					namespace: "testing2",
+					gateways:  []string{"testing1/fake1"},
+					dnsnames:  []string{"new.org"},
+				},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "example.org",
+					RecordType: endpoint.RecordTypeA,
+					Targets:    endpoint.Targets{"8.8.8.8"},
+				},
+				{
+					DNSName:    "example.org",
+					RecordType: endpoint.RecordTypeCNAME,
+					Targets:    endpoint.Targets{"lb.com"},
+				},
+			},
+		},
+		{
 			title:            "valid matching annotation filter expression",
 			annotationFilter: "kubernetes.io/virtualservice.class in (alb, nginx)",
 			lbServices: []fakeIngressGatewayService{
@@ -850,6 +1058,36 @@ func testVirtualServiceEndpoints(t *testing.T) {
 			annotationFilter: "kubernetes.io/gateway.name in (a b)",
 			expected:         []*endpoint.Endpoint{},
 			expectError:      true,
+		},
+		{
+			title: "gateway ingress annotation; ingress not found",
+			ingresses: []fakeIngress{
+				{
+					name:      "ingress1",
+					namespace: namespace,
+					ips:       []string{"8.8.8.8"},
+				},
+			},
+			gwConfigs: []fakeGatewayConfig{
+				{
+					name:      "fake1",
+					namespace: namespace,
+					dnsnames:  [][]string{{"*"}},
+					annotations: map[string]string{
+						IstioGatewayIngressSource: "ingress2",
+					},
+				},
+			},
+			vsConfigs: []fakeVirtualServiceConfig{
+				{
+					name:      "vs1",
+					namespace: namespace,
+					gateways:  []string{"fake1"},
+					dnsnames:  []string{"example.org"},
+				},
+			},
+			expected:    []*endpoint.Endpoint{},
+			expectError: true,
 		},
 		{
 			title: "our controller type is dns-controller",
@@ -1090,6 +1328,59 @@ func testVirtualServiceEndpoints(t *testing.T) {
 					dnsnames:  [][]string{{"*"}},
 					annotations: map[string]string{
 						targetAnnotationKey: "gateway-target.com",
+					},
+				},
+			},
+			vsConfigs: []fakeVirtualServiceConfig{
+				{
+					name:      "vs1",
+					namespace: namespace,
+					gateways:  []string{"fake1"},
+					dnsnames:  []string{"example.org"},
+				},
+				{
+					name:      "vs2",
+					namespace: namespace,
+					gateways:  []string{"fake1"},
+					dnsnames:  []string{"example2.org"},
+				},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "example.org",
+					Targets:    endpoint.Targets{"gateway-target.com"},
+					RecordType: endpoint.RecordTypeCNAME,
+				},
+				{
+					DNSName:    "example2.org",
+					Targets:    endpoint.Targets{"gateway-target.com"},
+					RecordType: endpoint.RecordTypeCNAME,
+				},
+			},
+		},
+		{
+			title: "virtualservice; gateway with target and ingress annotation",
+			lbServices: []fakeIngressGatewayService{
+				{
+					ips:       []string{"8.8.8.8"},
+					namespace: namespace,
+				},
+			},
+			ingresses: []fakeIngress{
+				{
+					name:      "ingress1",
+					ips:       []string{"1.1.1.1"},
+					namespace: namespace,
+				},
+			},
+			gwConfigs: []fakeGatewayConfig{
+				{
+					name:      "fake1",
+					namespace: namespace,
+					dnsnames:  [][]string{{"*"}},
+					annotations: map[string]string{
+						targetAnnotationKey:       "gateway-target.com",
+						IstioGatewayIngressSource: "ingress1",
 					},
 				},
 			},
@@ -1398,6 +1689,18 @@ func testVirtualServiceEndpoints(t *testing.T) {
 					namespace: "testing2",
 				},
 			},
+			ingresses: []fakeIngress{
+				{
+					name:      "ingress1",
+					namespace: "testing1",
+					hostnames: []string{"target4.com"},
+				},
+				{
+					name:      "ingress3",
+					namespace: "testing3",
+					hostnames: []string{"target5.com"},
+				},
+			},
 			gwConfigs: []fakeGatewayConfig{
 				{
 					name:      "fake1",
@@ -1423,6 +1726,17 @@ func testVirtualServiceEndpoints(t *testing.T) {
 						"app": "igw3",
 					},
 				},
+				{
+					name:      "fake4",
+					namespace: "testing3",
+					dnsnames:  [][]string{{"*.bax.com", "*.bar.com"}},
+					selector: map[string]string{
+						"app": "igw4",
+					},
+					annotations: map[string]string{
+						IstioGatewayIngressSource: "testing1/ingress1",
+					},
+				},
 			},
 			vsConfigs: []fakeVirtualServiceConfig{
 				{
@@ -1442,6 +1756,12 @@ func testVirtualServiceEndpoints(t *testing.T) {
 					namespace: "testing1",
 					gateways:  []string{"istio-system/fake1", "testing2/fake3"},
 					dnsnames:  []string{"world.bax.com", "world.bak.com"},
+				},
+				{
+					name:      "vs4",
+					namespace: "testing1",
+					gateways:  []string{"istio-system/fake1", "testing3/fake4"},
+					dnsnames:  []string{"foo.bax.com", "foo.bak.com"},
 				},
 			},
 			expected: []*endpoint.Endpoint{
@@ -1475,6 +1795,16 @@ func testVirtualServiceEndpoints(t *testing.T) {
 					Targets:    endpoint.Targets{"target1.com", "target3.com"},
 					RecordType: endpoint.RecordTypeCNAME,
 				},
+				{
+					DNSName:    "foo.bak.com",
+					Targets:    endpoint.Targets{"target1.com"},
+					RecordType: endpoint.RecordTypeCNAME,
+				},
+				{
+					DNSName:    "foo.bax.com",
+					Targets:    endpoint.Targets{"target1.com", "target4.com"},
+					RecordType: endpoint.RecordTypeCNAME,
+				},
 			},
 			fqdnTemplate: "{{.Name}}.ext-dns.test.com",
 		},
@@ -1483,7 +1813,7 @@ func testVirtualServiceEndpoints(t *testing.T) {
 		t.Run(ti.title, func(t *testing.T) {
 			t.Parallel()
 
-			var gateways []networkingv1alpha3.Gateway
+			var gateways []*networkingv1alpha3.Gateway
 			var virtualservices []*networkingv1alpha3.VirtualService
 
 			for _, gwItem := range ti.gwConfigs {
@@ -1501,10 +1831,16 @@ func testVirtualServiceEndpoints(t *testing.T) {
 				require.NoError(t, err)
 			}
 
+			for _, ing := range ti.ingresses {
+				ingress := ing.Ingress()
+				_, err := fakeKubernetesClient.NetworkingV1().Ingresses(ingress.Namespace).Create(context.Background(), ingress, metav1.CreateOptions{})
+				require.NoError(t, err)
+			}
+
 			fakeIstioClient := istiofake.NewSimpleClientset()
 
 			for _, gateway := range gateways {
-				_, err := fakeIstioClient.NetworkingV1alpha3().Gateways(gateway.Namespace).Create(context.Background(), &gateway, metav1.CreateOptions{})
+				_, err := fakeIstioClient.NetworkingV1alpha3().Gateways(gateway.Namespace).Create(context.Background(), gateway, metav1.CreateOptions{})
 				require.NoError(t, err)
 			}
 
@@ -1569,7 +1905,7 @@ func testGatewaySelectorMatchesService(t *testing.T) {
 	}
 }
 
-func newTestVirtualServiceSource(loadBalancerList []fakeIngressGatewayService, gwList []fakeGatewayConfig) (*virtualServiceSource, error) {
+func newTestVirtualServiceSource(loadBalancerList []fakeIngressGatewayService, ingressList []fakeIngress, gwList []fakeGatewayConfig) (*virtualServiceSource, error) {
 	fakeKubernetesClient := fake.NewSimpleClientset()
 	fakeIstioClient := istiofake.NewSimpleClientset()
 
@@ -1581,11 +1917,19 @@ func newTestVirtualServiceSource(loadBalancerList []fakeIngressGatewayService, g
 		}
 	}
 
+	for _, ing := range ingressList {
+		ingress := ing.Ingress()
+		_, err := fakeKubernetesClient.NetworkingV1().Ingresses(ingress.Namespace).Create(context.Background(), ingress, metav1.CreateOptions{})
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	for _, gw := range gwList {
 		gwObj := gw.Config()
 		// use create instead of add
 		// https://github.com/kubernetes/client-go/blob/92512ee2b8cf6696e9909245624175b7f0c971d9/testing/fixture.go#LL336C3-L336C52
-		_, err := fakeIstioClient.NetworkingV1alpha3().Gateways(gw.namespace).Create(context.Background(), &gwObj, metav1.CreateOptions{})
+		_, err := fakeIstioClient.NetworkingV1alpha3().Gateways(gw.namespace).Create(context.Background(), gwObj, metav1.CreateOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -1637,7 +1981,7 @@ func (c fakeVirtualServiceConfig) Config() *networkingv1alpha3.VirtualService {
 			Namespace:   c.namespace,
 			Annotations: c.annotations,
 		},
-		Spec: vs,
+		Spec: *vs.DeepCopy(),
 	}
 }
 
@@ -1658,21 +2002,21 @@ func TestVirtualServiceSourceGetGateway(t *testing.T) {
 		expectedErrStr string
 	}{
 		{name: "EmptyGateway", fields: fields{
-			virtualServiceSource: func() *virtualServiceSource { vs, _ := newTestVirtualServiceSource(nil, nil); return vs }(),
+			virtualServiceSource: func() *virtualServiceSource { vs, _ := newTestVirtualServiceSource(nil, nil, nil); return vs }(),
 		}, args: args{
 			ctx:            context.TODO(),
 			gatewayStr:     "",
 			virtualService: nil,
 		}, want: nil, expectedErrStr: ""},
 		{name: "MeshGateway", fields: fields{
-			virtualServiceSource: func() *virtualServiceSource { vs, _ := newTestVirtualServiceSource(nil, nil); return vs }(),
+			virtualServiceSource: func() *virtualServiceSource { vs, _ := newTestVirtualServiceSource(nil, nil, nil); return vs }(),
 		}, args: args{
 			ctx:            context.TODO(),
 			gatewayStr:     IstioMeshGateway,
 			virtualService: nil,
 		}, want: nil, expectedErrStr: ""},
 		{name: "MissingGateway", fields: fields{
-			virtualServiceSource: func() *virtualServiceSource { vs, _ := newTestVirtualServiceSource(nil, nil); return vs }(),
+			virtualServiceSource: func() *virtualServiceSource { vs, _ := newTestVirtualServiceSource(nil, nil, nil); return vs }(),
 		}, args: args{
 			ctx:        context.TODO(),
 			gatewayStr: "doesnt/exist",
@@ -1684,7 +2028,7 @@ func TestVirtualServiceSourceGetGateway(t *testing.T) {
 			},
 		}, want: nil, expectedErrStr: ""},
 		{name: "InvalidGatewayStr", fields: fields{
-			virtualServiceSource: func() *virtualServiceSource { vs, _ := newTestVirtualServiceSource(nil, nil); return vs }(),
+			virtualServiceSource: func() *virtualServiceSource { vs, _ := newTestVirtualServiceSource(nil, nil, nil); return vs }(),
 		}, args: args{
 			ctx:            context.TODO(),
 			gatewayStr:     "1/2/3/",
@@ -1692,7 +2036,7 @@ func TestVirtualServiceSourceGetGateway(t *testing.T) {
 		}, want: nil, expectedErrStr: "invalid gateway name (name or namespace/name) found '1/2/3/'"},
 		{name: "ExistingGateway", fields: fields{
 			virtualServiceSource: func() *virtualServiceSource {
-				vs, _ := newTestVirtualServiceSource(nil, []fakeGatewayConfig{{
+				vs, _ := newTestVirtualServiceSource(nil, nil, []fakeGatewayConfig{{
 					namespace: "bar",
 					name:      "foo",
 				}})
@@ -1751,7 +2095,13 @@ func TestVirtualServiceSourceGetGateway(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
-			assert.Equalf(t, tt.want, got, "getGateway(%v, %v, %v)", tt.args.ctx, tt.args.gatewayStr, tt.args.virtualService)
+			if tt.want != nil && got != nil {
+				tt.want.Spec.ProtoReflect()
+				tt.want.Status.ProtoReflect()
+				assert.Equalf(t, tt.want, got, "getGateway(%v, %v, %v)", tt.args.ctx, tt.args.gatewayStr, tt.args.virtualService)
+			} else {
+				assert.Equalf(t, tt.want, got, "getGateway(%v, %v, %v)", tt.args.ctx, tt.args.gatewayStr, tt.args.virtualService)
+			}
 		})
 	}
 }

@@ -34,6 +34,12 @@ const (
 	providerSpecificForceUpdate = "txt/force-update"
 )
 
+type endpointKey struct {
+	DNSName       string
+	RecordType    string
+	SetIdentifier string
+}
+
 // TXTRegistry implements registry interface with ownership implemented via associated TXT records
 type TXTRegistry struct {
 	provider provider.Provider
@@ -93,7 +99,7 @@ func getSupportedTypes() []string {
 	return []string{endpoint.RecordTypeA, endpoint.RecordTypeAAAA, endpoint.RecordTypeCNAME, endpoint.RecordTypeNS}
 }
 
-func (im *TXTRegistry) GetDomainFilter() endpoint.DomainFilterInterface {
+func (im *TXTRegistry) GetDomainFilter() endpoint.DomainFilter {
 	return im.provider.GetDomainFilter()
 }
 
@@ -115,7 +121,7 @@ func (im *TXTRegistry) Records(ctx context.Context) ([]*endpoint.Endpoint, error
 
 	endpoints := []*endpoint.Endpoint{}
 
-	labelMap := map[string]endpoint.Labels{}
+	labelMap := map[endpointKey]endpoint.Labels{}
 	txtRecordsMap := map[string]struct{}{}
 
 	for _, record := range records {
@@ -135,8 +141,13 @@ func (im *TXTRegistry) Records(ctx context.Context) ([]*endpoint.Endpoint, error
 		if err != nil {
 			return nil, err
 		}
+
 		endpointName, recordType := im.mapper.toEndpointName(record.DNSName)
-		key := createKey(endpointName, record.SetIdentifier, recordType)
+		key := endpointKey{
+			DNSName:       endpointName,
+			RecordType:    recordType,
+			SetIdentifier: record.SetIdentifier,
+		}
 		labelMap[key] = labels
 		txtRecordsMap[record.DNSName] = struct{}{}
 	}
@@ -151,12 +162,16 @@ func (im *TXTRegistry) Records(ctx context.Context) ([]*endpoint.Endpoint, error
 			dnsNameSplit[0] = im.wildcardReplacement
 		}
 		dnsName := strings.Join(dnsNameSplit, ".")
+		key := endpointKey{
+			DNSName:       dnsName,
+			RecordType:    ep.RecordType,
+			SetIdentifier: ep.SetIdentifier,
+		}
 
 		// Handle both new and old registry format with the preference for the new one
-		key := createKey(dnsName, ep.SetIdentifier)
-		keyType := createKey(key, ep.RecordType)
-		labels, labelsExist := labelMap[keyType]
-		if !labelsExist {
+		labels, labelsExist := labelMap[key]
+		if !labelsExist && ep.RecordType != endpoint.RecordTypeAAAA {
+			key.RecordType = ""
 			labels, labelsExist = labelMap[key]
 		}
 		if labelsExist {
@@ -200,7 +215,7 @@ func (im *TXTRegistry) generateTXTRecord(r *endpoint.Endpoint) []*endpoint.Endpo
 
 	endpoints := make([]*endpoint.Endpoint, 0)
 
-	if !im.txtEncryptEnabled && r.RecordType != endpoint.RecordTypeAAAA {
+	if !im.txtEncryptEnabled && !im.mapper.recordTypeInAffix() && r.RecordType != endpoint.RecordTypeAAAA {
 		// old TXT record format
 		txt := endpoint.NewEndpoint(im.mapper.toTXTName(r.DNSName), endpoint.RecordTypeTXT, r.Labels.Serialize(true, im.txtEncryptEnabled, im.txtEncryptAESKey))
 		if txt != nil {
@@ -287,19 +302,10 @@ func (im *TXTRegistry) ApplyChanges(ctx context.Context, changes *plan.Changes) 
 	return im.provider.ApplyChanges(ctx, filteredChanges)
 }
 
-// PropertyValuesEqual compares two attribute values for equality
-func (im *TXTRegistry) PropertyValuesEqual(name string, previous string, current string) bool {
-	return im.provider.PropertyValuesEqual(name, previous, current)
-}
-
 // AdjustEndpoints modifies the endpoints as needed by the specific provider
 func (im *TXTRegistry) AdjustEndpoints(endpoints []*endpoint.Endpoint) []*endpoint.Endpoint {
 	return im.provider.AdjustEndpoints(endpoints)
 }
-
-/**
-  TXT registry specific private methods
-*/
 
 /**
   nameMapper is the interface for mapping between the endpoint for the source
@@ -310,6 +316,7 @@ type nameMapper interface {
 	toEndpointName(string) (endpointName string, recordType string)
 	toTXTName(string) string
 	toNewTXTName(string, string) string
+	recordTypeInAffix() bool
 }
 
 type affixNameMapper struct {
@@ -338,12 +345,15 @@ func extractRecordTypeDefaultPosition(name string) (baseName, recordType string)
 
 // dropAffixExtractType strips TXT record to find an endpoint name it manages
 // it also returns the record type
-func (pr affixNameMapper) dropAffixExtractType(name string) (string, string) {
+func (pr affixNameMapper) dropAffixExtractType(name string) (baseName, recordType string) {
+	prefix := pr.prefix
+	suffix := pr.suffix
+
 	if pr.recordTypeInAffix() {
 		for _, t := range getSupportedTypes() {
 			t = strings.ToLower(t)
-			iPrefix := strings.ReplaceAll(pr.prefix, recordTemplate, t)
-			iSuffix := strings.ReplaceAll(pr.suffix, recordTemplate, t)
+			iPrefix := strings.ReplaceAll(prefix, recordTemplate, t)
+			iSuffix := strings.ReplaceAll(suffix, recordTemplate, t)
 
 			if pr.isPrefix() && strings.HasPrefix(name, iPrefix) {
 				return strings.TrimPrefix(name, iPrefix), t
@@ -355,16 +365,16 @@ func (pr affixNameMapper) dropAffixExtractType(name string) (string, string) {
 		}
 
 		// handle old TXT records
-		pr.prefix = pr.dropAffixTemplate(pr.prefix)
-		pr.suffix = pr.dropAffixTemplate(pr.suffix)
+		prefix = pr.dropAffixTemplate(prefix)
+		suffix = pr.dropAffixTemplate(suffix)
 	}
 
-	if pr.isPrefix() && strings.HasPrefix(name, pr.prefix) {
-		return extractRecordTypeDefaultPosition(strings.TrimPrefix(name, pr.prefix))
+	if pr.isPrefix() && strings.HasPrefix(name, prefix) {
+		return extractRecordTypeDefaultPosition(strings.TrimPrefix(name, prefix))
 	}
 
-	if pr.isSuffix() && strings.HasSuffix(name, pr.suffix) {
-		return extractRecordTypeDefaultPosition(strings.TrimSuffix(name, pr.suffix))
+	if pr.isSuffix() && strings.HasSuffix(name, suffix) {
+		return extractRecordTypeDefaultPosition(strings.TrimSuffix(name, suffix))
 	}
 
 	return "", ""
@@ -467,7 +477,6 @@ func (im *TXTRegistry) addToCache(ep *endpoint.Endpoint) {
 
 func (im *TXTRegistry) removeFromCache(ep *endpoint.Endpoint) {
 	if im.recordsCache == nil || ep == nil {
-		// return early.
 		return
 	}
 
@@ -478,20 +487,4 @@ func (im *TXTRegistry) removeFromCache(ep *endpoint.Endpoint) {
 			return
 		}
 	}
-}
-
-func createKey(elem ...string) string {
-	var sb strings.Builder
-
-	for _, e := range elem {
-		if e == "" {
-			continue
-		}
-		if sb.Len() != 0 {
-			sb.WriteString("::")
-		}
-		sb.WriteString(strings.ToLower(e))
-	}
-
-	return sb.String()
 }

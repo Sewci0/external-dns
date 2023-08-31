@@ -156,6 +156,10 @@ func (suite *PlanTestSuite) SetupTest() {
 		},
 		ProviderSpecific: endpoint.ProviderSpecific{
 			endpoint.ProviderSpecificProperty{
+				Name:  "alias",
+				Value: "false",
+			},
+			endpoint.ProviderSpecificProperty{
 				Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
 				Value: "true",
 			},
@@ -173,6 +177,10 @@ func (suite *PlanTestSuite) SetupTest() {
 				Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
 				Value: "false",
 			},
+			endpoint.ProviderSpecificProperty{
+				Name:  "alias",
+				Value: "false",
+			},
 		},
 	}
 	suite.bar127AWithProviderSpecificUnset = &endpoint.Endpoint{
@@ -182,7 +190,12 @@ func (suite *PlanTestSuite) SetupTest() {
 		Labels: map[string]string{
 			endpoint.ResourceLabelKey: "ingress/default/bar-127",
 		},
-		ProviderSpecific: endpoint.ProviderSpecific{},
+		ProviderSpecific: endpoint.ProviderSpecific{
+			endpoint.ProviderSpecificProperty{
+				Name:  "alias",
+				Value: "false",
+			},
+		},
 	}
 	suite.bar192A = &endpoint.Endpoint{
 		DNSName:    "bar",
@@ -342,21 +355,18 @@ func (suite *PlanTestSuite) TestSyncSecondRoundWithProviderSpecificChange() {
 	validateEntries(suite.T(), changes.Delete, expectedDelete)
 }
 
-func (suite *PlanTestSuite) TestSyncSecondRoundWithProviderSpecificDefaultFalse() {
+func (suite *PlanTestSuite) TestSyncSecondRoundWithProviderSpecificRemoval() {
 	current := []*endpoint.Endpoint{suite.bar127AWithProviderSpecificFalse}
 	desired := []*endpoint.Endpoint{suite.bar127AWithProviderSpecificUnset}
 	expectedCreate := []*endpoint.Endpoint{}
-	expectedUpdateOld := []*endpoint.Endpoint{}
-	expectedUpdateNew := []*endpoint.Endpoint{}
+	expectedUpdateOld := []*endpoint.Endpoint{suite.bar127AWithProviderSpecificFalse}
+	expectedUpdateNew := []*endpoint.Endpoint{suite.bar127AWithProviderSpecificUnset}
 	expectedDelete := []*endpoint.Endpoint{}
 
 	p := &Plan{
-		Policies: []Policy{&SyncPolicy{}},
-		Current:  current,
-		Desired:  desired,
-		PropertyComparator: func(name, previous, current string) bool {
-			return CompareBoolean(false, name, previous, current)
-		},
+		Policies:       []Policy{&SyncPolicy{}},
+		Current:        current,
+		Desired:        desired,
 		ManagedRecords: []string{endpoint.RecordTypeA, endpoint.RecordTypeCNAME},
 	}
 
@@ -367,21 +377,19 @@ func (suite *PlanTestSuite) TestSyncSecondRoundWithProviderSpecificDefaultFalse(
 	validateEntries(suite.T(), changes.Delete, expectedDelete)
 }
 
-func (suite *PlanTestSuite) TestSyncSecondRoundWithProviderSpecificDefualtTrue() {
-	current := []*endpoint.Endpoint{suite.bar127AWithProviderSpecificTrue}
-	desired := []*endpoint.Endpoint{suite.bar127AWithProviderSpecificUnset}
+func (suite *PlanTestSuite) TestSyncSecondRoundWithProviderSpecificAddition() {
+	current := []*endpoint.Endpoint{suite.bar127AWithProviderSpecificUnset}
+	desired := []*endpoint.Endpoint{suite.bar127AWithProviderSpecificTrue}
 	expectedCreate := []*endpoint.Endpoint{}
-	expectedUpdateOld := []*endpoint.Endpoint{}
-	expectedUpdateNew := []*endpoint.Endpoint{}
+	expectedUpdateOld := []*endpoint.Endpoint{suite.bar127AWithProviderSpecificUnset}
+	expectedUpdateNew := []*endpoint.Endpoint{suite.bar127AWithProviderSpecificTrue}
 	expectedDelete := []*endpoint.Endpoint{}
 
 	p := &Plan{
-		Policies: []Policy{&SyncPolicy{}},
-		Current:  current,
-		Desired:  desired,
-		PropertyComparator: func(name, previous, current string) bool {
-			return CompareBoolean(true, name, previous, current)
-		},
+		Policies:       []Policy{&SyncPolicy{}},
+		Current:        current,
+		Desired:        desired,
+		ManagedRecords: []string{endpoint.RecordTypeA, endpoint.RecordTypeCNAME},
 	}
 
 	changes := p.Calculate().Changes
@@ -744,15 +752,11 @@ func TestNormalizeDNSName(t *testing.T) {
 }
 
 func TestShouldUpdateProviderSpecific(tt *testing.T) {
-	comparator := func(name, previous, current string) bool {
-		return previous == current
-	}
 	for _, test := range []struct {
-		name               string
-		current            *endpoint.Endpoint
-		desired            *endpoint.Endpoint
-		propertyComparator func(name, previous, current string) bool
-		shouldUpdate       bool
+		name         string
+		current      *endpoint.Endpoint
+		desired      *endpoint.Endpoint
+		shouldUpdate bool
 	}{
 		{
 			name: "skip AWS target health",
@@ -768,8 +772,7 @@ func TestShouldUpdateProviderSpecific(tt *testing.T) {
 					{Name: "aws/evaluate-target-health", Value: "true"},
 				},
 			},
-			propertyComparator: comparator,
-			shouldUpdate:       false,
+			shouldUpdate: false,
 		},
 		{
 			name: "custom property unchanged",
@@ -783,8 +786,7 @@ func TestShouldUpdateProviderSpecific(tt *testing.T) {
 					{Name: "custom/property", Value: "true"},
 				},
 			},
-			propertyComparator: comparator,
-			shouldUpdate:       false,
+			shouldUpdate: false,
 		},
 		{
 			name: "custom property value changed",
@@ -798,54 +800,10 @@ func TestShouldUpdateProviderSpecific(tt *testing.T) {
 					{Name: "custom/property", Value: "false"},
 				},
 			},
-			propertyComparator: comparator,
-			shouldUpdate:       true,
-		},
-		{
-			name: "custom property key changed",
-			current: &endpoint.Endpoint{
-				ProviderSpecific: []endpoint.ProviderSpecificProperty{
-					{Name: "custom/property", Value: "true"},
-				},
-			},
-			desired: &endpoint.Endpoint{
-				ProviderSpecific: []endpoint.ProviderSpecificProperty{
-					{Name: "new/property", Value: "true"},
-				},
-			},
-			propertyComparator: comparator,
-			shouldUpdate:       true,
-		},
-		{
-			name: "desired has same key and value as current but not comparator is set",
-			current: &endpoint.Endpoint{
-				ProviderSpecific: []endpoint.ProviderSpecificProperty{
-					{Name: "custom/property", Value: "true"},
-				},
-			},
-			desired: &endpoint.Endpoint{
-				ProviderSpecific: []endpoint.ProviderSpecificProperty{
-					{Name: "custom/property", Value: "true"},
-				},
-			},
-			shouldUpdate: false,
-		},
-		{
-			name: "desired has same key and different value as current but not comparator is set",
-			current: &endpoint.Endpoint{
-				ProviderSpecific: []endpoint.ProviderSpecificProperty{
-					{Name: "custom/property", Value: "true"},
-				},
-			},
-			desired: &endpoint.Endpoint{
-				ProviderSpecific: []endpoint.ProviderSpecificProperty{
-					{Name: "custom/property", Value: "false"},
-				},
-			},
 			shouldUpdate: true,
 		},
 		{
-			name: "desired has different key from current but not comparator is set",
+			name: "custom property key changed",
 			current: &endpoint.Endpoint{
 				ProviderSpecific: []endpoint.ProviderSpecificProperty{
 					{Name: "custom/property", Value: "true"},
@@ -861,10 +819,9 @@ func TestShouldUpdateProviderSpecific(tt *testing.T) {
 	} {
 		tt.Run(test.name, func(t *testing.T) {
 			plan := &Plan{
-				Current:            []*endpoint.Endpoint{test.current},
-				Desired:            []*endpoint.Endpoint{test.desired},
-				PropertyComparator: test.propertyComparator,
-				ManagedRecords:     []string{endpoint.RecordTypeA, endpoint.RecordTypeCNAME},
+				Current:        []*endpoint.Endpoint{test.current},
+				Desired:        []*endpoint.Endpoint{test.desired},
+				ManagedRecords: []string{endpoint.RecordTypeA, endpoint.RecordTypeCNAME},
 			}
 			b := plan.shouldUpdateProviderSpecific(test.desired, test.current)
 			assert.Equal(t, test.shouldUpdate, b)

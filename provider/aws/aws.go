@@ -25,11 +25,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
-	"github.com/linki/instrumented_http"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 
@@ -80,6 +77,7 @@ var canonicalHostedZones = map[string]string{
 	"ap-southeast-1.elb.amazonaws.com":    "Z1LMS91P8CMLE5",
 	"ap-southeast-2.elb.amazonaws.com":    "Z1GM3OXH4ZPM65",
 	"ap-southeast-3.elb.amazonaws.com":    "Z08888821HLRG5A9ZRTER",
+	"ap-southeast-4.elb.amazonaws.com":    "Z09517862IB2WZLPXG76F",
 	"ap-northeast-1.elb.amazonaws.com":    "Z14GRHDCWA56QT",
 	"eu-central-1.elb.amazonaws.com":      "Z215JYRZR1TBD5",
 	"eu-central-2.elb.amazonaws.com":      "Z06391101F2ZOEP8P5EB3",
@@ -110,6 +108,7 @@ var canonicalHostedZones = map[string]string{
 	"elb.ap-southeast-1.amazonaws.com":    "ZKVM4W9LS7TM",
 	"elb.ap-southeast-2.amazonaws.com":    "ZCT6FZBF4DROD",
 	"elb.ap-southeast-3.amazonaws.com":    "Z01971771FYVNCOVWJU1G",
+	"elb.ap-southeast-4.amazonaws.com":    "Z01156963G8MIIL7X90IV",
 	"elb.ap-northeast-1.amazonaws.com":    "Z31USIVHYNEOWT",
 	"elb.eu-central-1.amazonaws.com":      "Z3F0SRJ5LGBH90",
 	"elb.eu-central-2.amazonaws.com":      "Z02239872DOALSIDCX66S",
@@ -129,7 +128,7 @@ var canonicalHostedZones = map[string]string{
 	"elb.af-south-1.amazonaws.com":        "Z203XCE67M25HM",
 	// Global Accelerator
 	"awsglobalaccelerator.com": "Z2BJ6XQ5FK7U4H",
-	// Cloudfront
+	// Cloudfront and AWS API Gateway edge-optimized endpoints
 	"cloudfront.net": "Z2FDTNDATAQYW2",
 	// VPC Endpoint (PrivateLink)
 	"eu-west-2.vpce.amazonaws.com":      "Z7K1066E3PUKB",
@@ -161,6 +160,32 @@ var canonicalHostedZones = map[string]string{
 	"us-gov-west-1.vpce.amazonaws.com":  "Z12529ZODG2B6H",
 	"us-west-1.vpce.amazonaws.com":      "Z12I86A8N7VCZO",
 	"us-west-2.vpce.amazonaws.com":      "Z1YSA3EXCYUU9Z",
+	// AWS API Gateway (Regional endpoints)
+	// See: https://docs.aws.amazon.com/general/latest/gr/apigateway.html
+	"execute-api.us-east-2.amazonaws.com":      "ZOJJZC49E0EPZ",
+	"execute-api.us-east-1.amazonaws.com":      "Z1UJRXOUMOOFQ8",
+	"execute-api.us-west-1.amazonaws.com":      "Z2MUQ32089INYE",
+	"execute-api.us-west-2.amazonaws.com":      "Z2OJLYMUO9EFXC",
+	"execute-api.af-south-1.amazonaws.com":     "Z2DHW2332DAMTN",
+	"execute-api.ap-east-1.amazonaws.com":      "Z3FD1VL90ND7K5",
+	"execute-api.ap-south-1.amazonaws.com":     "Z3VO1THU9YC4UR",
+	"execute-api.ap-northeast-2.amazonaws.com": "Z20JF4UZKIW1U8",
+	"execute-api.ap-southeast-1.amazonaws.com": "ZL327KTPIQFUL",
+	"execute-api.ap-southeast-2.amazonaws.com": "Z2RPCDW04V8134",
+	"execute-api.ap-northeast-1.amazonaws.com": "Z1YSHQZHG15GKL",
+	"execute-api.ca-central-1.amazonaws.com":   "Z19DQILCV0OWEC",
+	"execute-api.eu-central-1.amazonaws.com":   "Z1U9ULNL0V5AJ3",
+	"execute-api.eu-west-1.amazonaws.com":      "ZLY8HYME6SFDD",
+	"execute-api.eu-west-2.amazonaws.com":      "ZJ5UAJN8Y3Z2Q",
+	"execute-api.eu-south-1.amazonaws.com":     "Z3BT4WSQ9TDYZV",
+	"execute-api.eu-west-3.amazonaws.com":      "Z3KY65QIEKYHQQ",
+	"execute-api.eu-south-2.amazonaws.com":     "Z02499852UI5HEQ5JVWX3",
+	"execute-api.eu-north-1.amazonaws.com":     "Z3UWIKFBOOGXPP",
+	"execute-api.me-south-1.amazonaws.com":     "Z20ZBPC0SS8806",
+	"execute-api.me-central-1.amazonaws.com":   "Z08780021BKYYY8U0YHTV",
+	"execute-api.sa-east-1.amazonaws.com":      "ZCMLWB8V5SYIT",
+	"execute-api.us-gov-east-1.amazonaws.com":  "Z3SE9ATJYCRCZJ",
+	"execute-api.us-gov-west-1.amazonaws.com":  "Z1K6XKP9SAGWDV",
 }
 
 // Route53API is the subset of the AWS Route53 API that we actually use.  Add methods as required. Signatures must match exactly.
@@ -226,49 +251,15 @@ type AWSConfig struct {
 	BatchChangeSize      int
 	BatchChangeInterval  time.Duration
 	EvaluateTargetHealth bool
-	AssumeRole           string
-	AssumeRoleExternalID string
-	APIRetries           int
 	PreferCNAME          bool
 	DryRun               bool
 	ZoneCacheDuration    time.Duration
 }
 
 // NewAWSProvider initializes a new AWS Route53 based Provider.
-func NewAWSProvider(awsConfig AWSConfig) (*AWSProvider, error) {
-	config := aws.NewConfig().WithMaxRetries(awsConfig.APIRetries)
-
-	config.WithHTTPClient(
-		instrumented_http.NewClient(config.HTTPClient, &instrumented_http.Callbacks{
-			PathProcessor: func(path string) string {
-				parts := strings.Split(path, "/")
-				return parts[len(parts)-1]
-			},
-		}),
-	)
-
-	session, err := session.NewSessionWithOptions(session.Options{
-		Config:            *config,
-		SharedConfigState: session.SharedConfigEnable,
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to instantiate AWS session")
-	}
-
-	if awsConfig.AssumeRole != "" {
-		if awsConfig.AssumeRoleExternalID != "" {
-			log.Infof("Assuming role: %s with external id %s", awsConfig.AssumeRole, awsConfig.AssumeRoleExternalID)
-			session.Config.WithCredentials(stscreds.NewCredentials(session, awsConfig.AssumeRole, func(p *stscreds.AssumeRoleProvider) {
-				p.ExternalID = &awsConfig.AssumeRoleExternalID
-			}))
-		} else {
-			log.Infof("Assuming role: %s", awsConfig.AssumeRole)
-			session.Config.WithCredentials(stscreds.NewCredentials(session, awsConfig.AssumeRole))
-		}
-	}
-
+func NewAWSProvider(awsConfig AWSConfig, client Route53API) (*AWSProvider, error) {
 	provider := &AWSProvider{
-		client:               route53.New(session),
+		client:               client,
 		domainFilter:         awsConfig.DomainFilter,
 		zoneIDFilter:         awsConfig.ZoneIDFilter,
 		zoneTypeFilter:       awsConfig.ZoneTypeFilter,
@@ -517,11 +508,11 @@ func (p *AWSProvider) createUpdateChanges(newEndpoints, oldEndpoints []*endpoint
 }
 
 // GetDomainFilter generates a filter to exclude any domain that is not controlled by the provider
-func (p *AWSProvider) GetDomainFilter() endpoint.DomainFilterInterface {
+func (p *AWSProvider) GetDomainFilter() endpoint.DomainFilter {
 	zones, err := p.Zones(context.Background())
 	if err != nil {
 		log.Errorf("failed to list zones: %v", err)
-		return &endpoint.DomainFilter{}
+		return endpoint.DomainFilter{}
 	}
 	zoneNames := []string(nil)
 	for _, z := range zones {
@@ -684,6 +675,10 @@ func (p *AWSProvider) AdjustEndpoints(endpoints []*endpoint.Endpoint) []*endpoin
 		}
 
 		if alias {
+			if ep.RecordTTL.IsConfigured() {
+				log.Debugf("Modifying endpoint: %v, setting ttl=%v", ep, recordTTL)
+				ep.RecordTTL = recordTTL
+			}
 			if prop, ok := ep.GetProviderSpecificProperty(providerSpecificEvaluateTargetHealth); ok {
 				if prop != "true" && prop != "false" {
 					ep.SetProviderSpecificProperty(providerSpecificEvaluateTargetHealth, "false")
